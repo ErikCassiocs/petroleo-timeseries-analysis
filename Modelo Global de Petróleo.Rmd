@@ -1,0 +1,211 @@
+# Instalar pacotes se necessário
+install.packages(c("quantmod", "tidyverse", "forecast"))
+install.packages("FinTS")
+install.packages("rugarch")
+install.packages("tseries")
+
+# Carregar pacotes
+library(quantmod)
+library(tidyverse)
+library(forecast)
+
+# Baixar histórico WTI
+getSymbols("CL=F", src = "yahoo", from = "2000-01-01", to = Sys.Date())
+
+# Conferir dados
+head(`CL=F`)
+
+# Extrair preços de fechamento ajustados
+preco_wti <- `CL=F`[, "CL=F.Adjusted"]
+
+# Converter para série temporal mensal (opcional)
+preco_wti_monthly <- to.monthly(preco_wti, indexAt = "lastof", OHLC = FALSE)
+
+# Transformar em ts
+preco_ts <- ts(as.numeric(preco_wti_monthly), start = c(2000, 1), frequency = 12)
+plot(preco_ts, main="Preço do Barril de Petróleo WTI", ylab="USD", xlab="Ano")
+
+# Estatísticas básicas
+summary(preco_ts)
+
+# Teste de estacionariedade (ADF)
+
+library("tseries")
+adf.test(preco_ts)
+
+preco_log <- log(preco_ts)
+preco_diff <- diff(preco_log)
+preco_diff <- na.omit(preco_diff)
+
+#procurar o melhor balor bic
+library(forecast)
+arima_model <- auto.arima(preco_log)
+sarima_model <- auto.arima(preco_log, seasonal=TRUE)
+arma_model <- auto.arima(diff(preco_log), d=0)
+ets_model <- ets(preco_log)
+
+AIC(arma_model)
+BIC(arma_model)
+
+AIC(arima_model)
+BIC(arima_model)
+
+AIC(sarima_model)
+BIC(sarima_model)
+
+AIC(ets_model)
+BIC(ets_model)
+
+modelos <- list(
+  ARMA   = arma_model,
+  ARIMA  = arima_model,
+  SARIMA = sarima_model,
+  ETS    = ets_model
+)
+
+aic_values <- sapply(modelos, AIC)
+bic_values <- sapply(modelos, BIC)
+
+aic_values
+bic_values
+
+summary(arma_model)
+summary(arima_model)
+summary(sarima_model)
+summary(ets_model)
+
+checkresiduals(arima_model)
+checkresiduals(sarima_model)
+checkresiduals(arma_model)
+checkresiduals(ets_model)
+
+#O ARCH Test (Engle, 1982) verifica se há heterocedasticidade condicional nos resíduos.
+
+#H0: não há efeito ARCH (variância constante)
+#H1: existe efeito ARCH (volatilidade agrupada)
+
+
+library(FinTS)
+ArchTest(residuals(arima_model))
+
+#Isso significa:
+
+#✔ Os resíduos do seu ARIMA não têm variância constante
+#✔ Existe volatilidade agrupada (clusters de alta e baixa volatilidade)
+#✔ O modelo linear ARIMA captura a média, mas não captura a variabilidade
+
+#No mercado de petróleo:
+#Isso é típico em crises, choques geopolíticos ou mudanças de oferta/demanda
+#Há períodos de alta volatilidade seguidos por períodos calmos
+
+#Ajustar ARIMA + GARCH
+#ARIMA captura a média
+#GARCH captura a volatilidade condicional
+
+# Ajusta ARIMA na média
+arima_model <- auto.arima(preco_log)
+
+# Resíduos do ARIMA (média removida)
+residuos <- residuals(arima_model)
+
+# Especificação GARCH nos resíduos
+
+library("rugarch")
+spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+  mean.model     = list(armaOrder = c(0,0), include.mean = FALSE)
+)
+
+# Ajuste do modelo
+garch_fit <- ugarchfit(spec = spec, data = residuos)
+garch_fit
+
+# Diagnóstico dos resíduos do GARCH
+
+residuos_garch <- residuals(garch_fit, standardize = TRUE)
+
+# Plot resíduos padronizados
+plot(residuos_garch, main="Resíduos padronizados do GARCH")
+
+# Autocorrelação
+acf(residuos_garch, main="ACF dos resíduos do GARCH")
+pacf(residuos_garch, main="PACF dos resíduos do GARCH")
+
+# Teste Ljung-Box
+Box.test(residuos_garch, lag=20, type="Ljung-Box")
+
+# Teste ARCH
+ArchTest(residuos_garch)
+
+# 
+#  Previsão ARIMA + GARCH
+# 
+library(ggplot2)
+library(zoo)
+
+h <- 12
+
+# Previsão ARIMA
+arima_forecast <- forecast(arima_model, h=h)
+mean_forecast <- as.numeric(arima_forecast$mean)
+
+# Previsão GARCH
+garch_forecast <- ugarchforecast(garch_fit, n.ahead=h)
+sigma_forecast <- as.numeric(sigma(garch_forecast))
+
+# Intervalos de confiança
+upper_log <- mean_forecast + 1.96 * sigma_forecast
+lower_log <- mean_forecast - 1.96 * sigma_forecast
+
+mean_price <- exp(mean_forecast)
+upper_price <- exp(upper_log)
+lower_price <- exp(lower_log)
+
+# Criar datas futuras usando índice real do ts
+ultimo_mes <- index(preco_wti_monthly)[length(preco_wti_monthly)]
+future_time <- seq(from = ultimo_mes %m+% months(1), by = "1 month", length.out = h)
+future_time <- as.yearmon(future_time)
+
+# Criar data frame para forecast
+forecast_df <- data.frame(
+  Mes = future_time,
+  Mean = mean_price,
+  Upper = upper_price,
+  Lower = lower_price
+)
+
+# Criar data frame histórico
+historico_df <- data.frame(
+  Mes = as.yearmon(index(preco_wti_monthly)),
+  Preco = as.numeric(preco_ts)
+)
+
+# Plot usando ggplot puro
+ggplot() +
+  geom_line(data=historico_df, aes(x=Mes, y=Preco), color="black") +
+  geom_line(data=forecast_df, aes(x=Mes, y=Mean), color="blue", linewidth=1.2) +
+  geom_ribbon(data=forecast_df, aes(x=Mes, ymin=Lower, ymax=Upper), alpha=0.2, fill="blue") +
+  labs(title="Previsão ARIMA + GARCH do preço WTI",
+       x="Ano", y="Preço (USD)") +
+  theme_minimal()
+  forecast_df
+  
+library(dplyr)
+library(zoo)
+library(knitr)
+
+# Últimos 10 meses de histórico
+historico_recent <- historico_df %>%
+  tail(10) %>%
+  rename(Mean = Preco) %>%
+  mutate(Lower = NA, Upper = NA)
+
+# Previsões futuras já temos em forecast_df
+
+# Combinar histórico + previsão
+tabela_completa <- bind_rows(historico_recent, forecast_df)
+
+#  Mostrar tabela
+kable(tabela_completa, digits = 2, caption = "Últimos 10 meses de histórico + 12 meses de previsão ARIMA+GARCH")
+
+
